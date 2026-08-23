@@ -20,7 +20,7 @@ Nueve por ciento. Todo lo demás era duplicación o ruido del bot. La lección
 general: **antes de optimizar un pipeline, desglosa quién lo dispara** — es
 probable que el trabajo real sea la minoría.
 
-## Las ocho reglas
+## Las nueve reglas
 
 ### R1 · Un solo workflow de CI por repo
 Si dos workflows corren `tsc --noEmit` sobre el mismo código, uno sobra.
@@ -103,6 +103,47 @@ aparece en la factura de "Actions". Conservar 10 versiones + todos los `v*`
 (`gc-packages.yml`). **No borrar versiones sin tag**: el `:buildcache` depende
 de ellas.
 
+### R9 · Los `cron` son el gasto que nadie ve — y la cuota es de la CUENTA
+El hallazgo más caro de toda la auditoría no estaba en ningún pipeline de
+features: `hubwell_portal/e2e-prod.yml` corría con `cron: "*/15 * * * *"`.
+Son 96 corridas al día; medido, cada una dura ~84 s y GitHub la factura como
+**2 min** (redondeo al minuto por job) ⇒ **~192 min/día**. Ese solo workflow
+agotaba la cuota de la cuenta en ~10 días **sin que nadie hiciera un commit**.
+
+Tres cosas que hay que interiorizar:
+
+1. **La cuota es de la cuenta, no del repo.** Optimizar un repo mientras otro
+   sangra por `cron` no sirve de nada. Antes de dar por buena una optimización,
+   suma las corridas de TODOS los repos.
+2. **Un `cron` no aparece cuando revisas "el CI".** No lo dispara nadie, no
+   sale en los PRs y no falla: solo cobra. Al auditar, lo primero es
+   `grep -rn "cron:" .github/workflows/` en **todos** los repos.
+3. **El monitoreo continuo de uptime no es trabajo de Actions.** Un runner que
+   arranca una VM, instala Node, descarga Chromium (`playwright install
+   --with-deps`) y pide una URL es la forma más cara posible de hacer un ping.
+   Eso es de un uptime monitor o del NOC. En Actions, el E2E contra producción
+   se dispara **cuando algo puede haberse roto**: `workflow_run` al terminar un
+   deploy con éxito, más un canario diario.
+
+```yaml
+on:
+  workflow_run:
+    workflows: ["Deploy production (...)"]
+    types: [completed]
+  schedule:
+    - cron: "17 6 * * *"   # canario diario, NO cada 15 min
+  workflow_dispatch:
+jobs:
+  smoke:
+    # si el deploy falló, su rollback ya actuó: no gastes una corrida
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+```
+
+Regla práctica: **ningún `cron` con frecuencia menor a un día sin un número
+escrito al lado que justifique el costo.**
+
 ## Sobre el paralelismo entre jobs
 
 **GitHub factura cada job redondeado hacia arriba al minuto.** Siete jobs de
@@ -141,6 +182,8 @@ Para repos que construyen imagen, `hubwell_react` es la referencia:
 
 ## Al migrar un repo
 
+0. `grep -rn "cron:" .github/workflows/` **primero** (R9): suele ser el gasto
+   mayor y el más fácil de quitar.
 1. Fusionar los CI en `ci.yml`, `on: pull_request` únicamente, con `draft` fuera.
 2. Quitar todo `tsc --noEmit` que duplique el build (R3).
 3. Quitar los `services:` que no use el 100 % de las corridas (R7).
