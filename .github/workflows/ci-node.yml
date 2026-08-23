@@ -1,0 +1,113 @@
+name: ci-node (reusable)
+
+# CI de un SOLO JOB para repos Node/Next/Nest. Reemplaza a ci-node-next.yml,
+# que repartía lint/typecheck/test/audit/build en CINCO jobs.
+#
+# Por qué importa: GitHub factura CADA JOB redondeado hacia arriba al minuto.
+# Cinco jobs de 40 s cuestan 5 minutos facturados para hacer ~3 min de trabajo
+# real; el mismo trabajo secuencial en un job cuesta 3. En repos privados que
+# despliegan a diario, ese redondeo era la mitad de la factura de Actions.
+# Se pierde ~1 min de reloj en el PR y se gana ~40 % de la cuota mensual.
+#
+# El otro cambio de fondo va en el CALLER, no aquí: llamar este workflow SOLO
+# desde `pull_request`. Correrlo también en el push a la rama de integración y
+# otra vez en el push a producción es probar tres veces el mismo commit.
+
+on:
+  workflow_call:
+    inputs:
+      node_version:      { required: false, default: "22",  type: string }
+      package_manager:   { required: false, default: "pnpm", type: string }
+      pnpm_version:      { required: false, default: "10.18.3", type: string }
+      working_directory: { required: false, default: ".",   type: string }
+      lockfile:          { required: false, default: "",    type: string }
+      install_command:   { required: false, default: "",    type: string }
+      run_lint:          { required: false, default: false, type: boolean }
+      run_typecheck:     { required: false, default: true,  type: boolean }
+      run_test:          { required: false, default: true,  type: boolean }
+      run_build:         { required: false, default: true,  type: boolean }
+      # `audit` va en false por defecto a propósito: era `continue-on-error`,
+      # o sea que nunca bloqueó nada, pero costaba su minuto facturado en cada
+      # run. Auditar dependencias es trabajo de Dependabot (mensual, agrupado),
+      # no de cada push.
+      run_audit:         { required: false, default: false, type: boolean }
+      audit_level:       { required: false, default: "high", type: string }
+      next_cache:        { required: false, default: false, type: boolean }
+      extra_env:         { required: false, default: "",    type: string }
+
+jobs:
+  ci:
+    # NOMBRE CONGELADO: es el status check requerido en los repos que lo usan.
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Env extra
+        if: inputs.extra_env != ''
+        run: printf '%s\n' "${{ inputs.extra_env }}" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+        if: inputs.package_manager == 'pnpm'
+        with:
+          version: ${{ inputs.pnpm_version }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+          cache-dependency-path: ${{ inputs.lockfile }}
+
+      - name: install
+        run: |
+          if [ -n "${{ inputs.install_command }}" ]; then
+            ${{ inputs.install_command }}
+          elif [ "${{ inputs.package_manager }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          elif [ "${{ inputs.package_manager }}" = "yarn" ]; then
+            yarn install --immutable
+          else
+            npm ci
+          fi
+
+      # El cache incremental de Next es la diferencia entre ~3 min y ~70 s: el
+      # runner es una VM nueva en cada run, así que sin esto compila en frío.
+      - name: cache de Next
+        if: inputs.next_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.working_directory }}/.next/cache
+          key: next-${{ hashFiles(inputs.lockfile) }}-${{ github.sha }}
+          restore-keys: |
+            next-${{ hashFiles(inputs.lockfile) }}-
+            next-
+
+      - name: lint
+        if: inputs.run_lint
+        run: ${{ inputs.package_manager }} run lint
+
+      - name: typecheck
+        if: inputs.run_typecheck
+        run: ${{ inputs.package_manager }} run typecheck
+
+      - name: test
+        if: inputs.run_test
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.test?0:1)" 2>/dev/null; then
+            ${{ inputs.package_manager }} run test
+          else
+            echo "::warning::sin script 'test' — saltando"
+          fi
+
+      - name: build
+        if: inputs.run_build
+        run: ${{ inputs.package_manager }} run build
+
+      - name: audit
+        if: inputs.run_audit
+        continue-on-error: true
+        run: ${{ inputs.package_manager }} audit --audit-level ${{ inputs.audit_level }}
