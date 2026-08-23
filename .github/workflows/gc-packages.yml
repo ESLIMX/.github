@@ -1,0 +1,88 @@
+name: gc-packages (reusable)
+
+# Retención de imágenes en GHCR, reutilizable por cualquier repo.
+#
+# Por qué existe: el almacenamiento de packages PRIVADOS se cobra contra el
+# MISMO spending limit que los minutos de Actions. Un repo que despliega a
+# diario acumula ~30 versiones al mes y nunca borra ninguna, así que el
+# presupuesto se drena por un lado que no aparece en la factura de "Actions" —
+# lo que hace parecer que los minutos se agotan más rápido de lo que se gastan.
+#
+# NO borra versiones sin tag: el cache de buildx en registro (`:buildcache`)
+# apunta a manifiestos sin tag, y barrerlos deja el cache inservible, que es
+# justo lo que vuelve lentos a los builds.
+
+on:
+  workflow_call:
+    inputs:
+      packages:
+        description: "Nombres de los packages container, separados por espacio"
+        required: true
+        type: string
+      keep:
+        description: "Versiones etiquetadas a conservar por package"
+        required: false
+        default: 10
+        type: number
+      protected_regex:
+        description: "Tags que nunca se borran"
+        required: false
+        default: '^(buildcache|stable|prod|latest|v[0-9]+\.[0-9]+\.[0-9]+.*)$'
+        type: string
+      dry_run:
+        required: false
+        default: false
+        type: boolean
+      owner_type:
+        description: "user | org"
+        required: false
+        default: "user"
+        type: string
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Podar
+        run: |
+          set -euo pipefail
+          KEEP=${{ inputs.keep }}
+          PROTECTED='${{ inputs.protected_regex }}'
+          DRY='${{ inputs.dry_run }}'
+          if [ "${{ inputs.owner_type }}" = "org" ]; then
+            BASE="/orgs/${{ github.repository_owner }}/packages/container"
+          else
+            BASE="/user/packages/container"
+          fi
+
+          for PKG in ${{ inputs.packages }}; do
+            echo "══════ $PKG (conservar $KEEP) ══════"
+            if ! gh api "$BASE/$PKG/versions?per_page=100" --paginate \
+                 --jq '.[] | {id, tags: (.metadata.container.tags // [])} | @json' > /tmp/v.json; then
+              echo "::warning::sin acceso a $PKG — saltando"; continue
+            fi
+            echo "versiones: $(wc -l < /tmp/v.json)"
+
+            n=0
+            while IFS= read -r line; do
+              id=$(jq -r '.id' <<<"$line")
+              tags=$(jq -r '.tags | join(",")' <<<"$line")
+              [ -z "$tags" ] && continue
+              if jq -e --arg re "$PROTECTED" '.tags | any(test($re))' <<<"$line" >/dev/null; then
+                echo "  protegida  $tags"; continue
+              fi
+              n=$((n+1))
+              if [ "$n" -le "$KEEP" ]; then echo "  conservar  $tags"; continue; fi
+              if [ "$DRY" = "true" ]; then
+                echo "  [dry] borrar $tags"
+              else
+                echo "  borrar     $tags"
+                gh api -X DELETE "$BASE/$PKG/versions/$id" || echo "::warning::no se pudo borrar $id"
+              fi
+            done < /tmp/v.json
+          done
